@@ -390,20 +390,28 @@ jobs:
           });
           NODE
 
-      - name: Upload temporary media
+      - name: Publish stable media
         if: github.event_name == 'issues'
         id: media
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          MEDIA_TAG="cache-${{ github.event.issue.number }}-${{ github.run_id }}"
-          gh release create "$MEDIA_TAG" rendered/*.jpg \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "media cache" \
-            --notes "Temporary publishing media." \
-            --prerelease
-          echo "tag=$MEDIA_TAG" >> "$GITHUB_OUTPUT"
+          MEDIA_DATE="$(date -u +%F)"
+          MEDIA_DIR="media/${MEDIA_DATE}/cache-${{ github.event.issue.number }}-${{ github.run_id }}"
+          mkdir -p "$MEDIA_DIR"
+          cp rendered/*.jpg "$MEDIA_DIR"/
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$MEDIA_DIR"
+          git commit -m "Add publishing media for issue #${{ github.event.issue.number }}"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main
+
+          echo "path=$MEDIA_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Add posts to Buffer queue
         if: github.event_name == 'issues' && steps.render.outputs.dry_run != 'true'
@@ -411,7 +419,7 @@ jobs:
         env:
           BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
           CHANNEL_ID: ${{ steps.buffer.outputs.channel_id }}
-          MEDIA_TAG: ${{ steps.media.outputs.tag }}
+          MEDIA_PATH: ${{ steps.media.outputs.path }}
         run: |
           node <<'NODE'
           const fs = require('node:fs');
@@ -421,7 +429,7 @@ jobs:
           const token = process.env.BUFFER_API_KEY;
           const channelId = process.env.CHANNEL_ID;
           const repository = process.env.GITHUB_REPOSITORY;
-          const tag = process.env.MEDIA_TAG;
+          const mediaPath = process.env.MEDIA_PATH;
           const manifest = JSON.parse(fs.readFileSync('/tmp/render-manifest.json', 'utf8'));
 
           async function bufferRequest(query, variables = {}) {
@@ -442,11 +450,16 @@ jobs:
 
           async function waitUntilPublic(url) {
             for (let attempt = 1; attempt <= 8; attempt++) {
-              const response = await fetch(url, { method: 'HEAD', redirect: 'follow' });
-              if (response.ok) return;
+              const response = await fetch(url, {
+                method: 'GET',
+                redirect: 'follow',
+                headers: { Range: 'bytes=0-0' },
+              });
+              const contentType = response.headers.get('content-type') || '';
+              if (response.ok && contentType.startsWith('image/')) return;
               await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
             }
-            throw new Error(`Media did not become public: ${url}`);
+            throw new Error(`Media did not become directly available: ${url}`);
           }
 
           const mutation = `
@@ -465,7 +478,7 @@ jobs:
           for (const post of manifest.posts) {
             const slides = post.slides.map((slide) => ({
               ...slide,
-              url: `https://github.com/${repository}/releases/download/${tag}/${slide.filename}`,
+              url: `https://raw.githubusercontent.com/${repository}/main/${mediaPath}/${slide.filename}`,
             }));
             for (const slide of slides) await waitUntilPublic(slide.url);
 
